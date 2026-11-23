@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>Sky Bridge VR - Cloud Blind & CLEAR</title>
+  <meta name="description" content="雲で視界が遮られる空中橋を渡りきり金のリングでCLEARを目指すA-Frame VRコンテンツ">
+  <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; }
+    #hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(15, 23, 42, 0.75);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.55;
+      pointer-events: none;
+    }
+    #cloud-veil {
+      position: fixed;
+      inset: 0;
+      z-index: 15;
+      background: rgba(248, 250, 252, 0.94);
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      pointer-events: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #475569;
+      font-size: 18px;
+      font-weight: bold;
+      letter-spacing: 3px;
+    }
+    #cloud-veil.active {
+      opacity: 1;
+    }
+    .overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 25;
+      color: #ffffff;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      backdrop-filter: blur(4px);
+    }
+    .overlay.active {
+      display: flex;
+    }
+    #game-over-overlay {
+      background: rgba(127, 29, 29, 0.75);
+    }
+    #clear-overlay {
+      background: rgba(6, 78, 59, 0.78);
+    }
+    .overlay h1 {
+      font-size: 64px;
+      letter-spacing: 8px;
+      margin: 0 0 12px 0;
+      text-shadow: 0 4px 20px rgba(0, 0, 0, 0.55);
+    }
+    .overlay p {
+      font-size: 18px;
+      margin: 0 0 24px 0;
+    }
+    .retry-btn {
+      padding: 12px 28px;
+      font-size: 16px;
+      font-weight: bold;
+      color: #0f172a;
+      background: #ffd166;
+      border: none;
+      border-radius: 999px;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    }
+    .retry-btn:hover {
+      background: #ffe08a;
+    }
+  </style>
+  <script>
+    // 足場判定・Spaceジャンプ・落下・雲による視界遮断・ゴールCLEARを制御
+    AFRAME.registerComponent('bridge-physics', {
+      schema: {
+        deckY: { type: 'number', default: 82 },         // 足場上の目線高さ（橋y=80 + 目線2）
+        groundY: { type: 'number', default: 2 },        // 地上の目線高さ
+        gravity: { type: 'number', default: 34 },       // 重力加速度
+        jumpVelocity: { type: 'number', default: 12.5 } // ジャンプ初速
+      },
+      init: function () {
+        this.vy = 0;
+        this.isGrounded = true;
+        this.falling = false;
+        this.isGameOver = false;
+        this.isCleared = false;
+        this.cameraEl = this.el.querySelector('a-camera');
+        this.cloudVeil = document.getElementById('cloud-veil');
+        this.gameOverEl = document.getElementById('game-over-overlay');
+        this.clearEl = document.getElementById('clear-overlay');
+
+        // ガラス板の中心Z座標（z = -6 から -36 まで 3.0 間隔、各板の奥行は 1.8）
+        this.plankCenters = [];
+        for (let z = -6; z >= -36; z -= 3.0) {
+          this.plankCenters.push(z);
+        }
+
+        // 歩ける足場
+        this.platforms = [
+          { xMin: -3.8, xMax: 3.8, zMin: -4.2, zMax: 4.2 },     // スタートデッキ
+          { xMin: -4.5, xMax: 4.5, zMin: -48.5, zMax: -38.5 }   // ゴールタワー
+        ];
+        this.plankCenters.forEach(z => {
+          this.platforms.push({
+            xMin: -1.15,
+            xMax: 1.15,
+            zMin: z - 0.9,
+            zMax: z + 0.9
+          });
+        });
+
+        window.addEventListener('keydown', (e) => {
+          if (e.code === 'Space') {
+            e.preventDefault();
+            if (!this.isGameOver && !this.isCleared && !this.falling && this.isGrounded) {
+              this.vy = this.data.jumpVelocity;
+              this.isGrounded = false;
+            }
+          } else if ((e.key === 'r' || e.key === 'R') && (this.isGameOver || this.isCleared)) {
+            this.resetGame();
+          }
+        });
+
+        document.querySelectorAll('.retry-btn').forEach(btn => {
+          btn.addEventListener('click', () => this.resetGame());
+        });
+      },
+      getPlayerWorldPos: function () {
+        const rigPos = this.el.object3D.position;
+        const camPos = this.cameraEl ? this.cameraEl.object3D.position : { x: 0, y: 0, z: 0 };
+        return {
+          x: rigPos.x + camPos.x,
+          y: rigPos.y + camPos.y,
+          z: rigPos.z + camPos.z
+        };
+      },
+      isOnPlatform: function (x, z) {
+        return this.platforms.some(p =>
+          x >= p.xMin && x <= p.xMax && z >= p.zMin && z <= p.zMax
+        );
+      },
+      setMovementEnabled: function (enabled) {
+        if (this.cameraEl && this.cameraEl.components['wasd-controls']) {
+          this.cameraEl.components['wasd-controls'].data.enabled = enabled;
+        }
+      },
+      updateCloudBlindness: function (playerPos) {
+        if (this.isGameOver || this.isCleared) {
+          this.cloudVeil.classList.remove('active');
+          return;
+        }
+        const clouds = document.querySelectorAll('.drift-cloud');
+        let insideCloud = false;
+        const worldPos = new THREE.Vector3();
+
+        clouds.forEach(cloud => {
+          cloud.object3D.getWorldPosition(worldPos);
+          const dx = playerPos.x - worldPos.x;
+          const dy = playerPos.y - worldPos.y;
+          const dz = playerPos.z - worldPos.z;
+          const distSq = dx * dx + dy * dy + dz * dz;
+          // 雲の半径約5.5m以内に入ったら視界を遮る
+          if (distSq < 5.5 * 5.5) {
+            insideCloud = true;
+          }
+        });
+
+        if (insideCloud) {
+          this.cloudVeil.classList.add('active');
+        } else {
+          this.cloudVeil.classList.remove('active');
+        }
+      },
+      triggerGameOver: function () {
+        if (this.isGameOver || this.isCleared) return;
+        this.isGameOver = true;
+        this.cloudVeil.classList.remove('active');
+        this.gameOverEl.classList.add('active');
+      },
+      triggerClear: function () {
+        if (this.isCleared || this.isGameOver) return;
+        this.isCleared = true;
+        this.cloudVeil.classList.remove('active');
+        this.setMovementEnabled(false);
+        this.clearEl.classList.add('active');
+      },
+      resetGame: function () {
+        this.isGameOver = false;
+        this.isCleared = false;
+        this.falling = false;
+        this.isGrounded = true;
+        this.vy = 0;
+        this.el.object3D.position.set(0, this.data.deckY, 2);
+        if (this.cameraEl) {
+          this.cameraEl.object3D.position.set(0, 0, 0);
+        }
+        this.setMovementEnabled(true);
+        this.gameOverEl.classList.remove('active');
+        this.clearEl.classList.remove('active');
+        this.cloudVeil.classList.remove('active');
+      },
+      tick: function (time, timeDelta) {
+        if (this.isGameOver || this.isCleared) return;
+
+        const dt = Math.min(timeDelta / 1000, 0.05);
+        const pos = this.el.object3D.position;
+        const playerPos = this.getPlayerWorldPos();
+
+        // 雲による視界遮断チェック
+        this.updateCloudBlindness(playerPos);
+
+        // ゴール（金の円 x=0, z=-43 付近）到達チェック
+        const goalDx = playerPos.x - 0;
+        const goalDz = playerPos.z - (-43);
+        if (Math.sqrt(goalDx * goalDx + goalDz * goalDz) < 2.6 && !this.falling) {
+          this.triggerClear();
+          return;
+        }
+
+        const onSafeDeck = this.isOnPlatform(playerPos.x, playerPos.z);
+
+        // 落下中
+        if (this.falling) {
+          this.vy -= this.data.gravity * dt;
+          pos.y += this.vy * dt;
+
+          if (pos.y <= this.data.groundY) {
+            pos.y = this.data.groundY;
+            this.vy = 0;
+            this.falling = false;
+            this.triggerGameOver();
+          }
+          return;
+        }
+
+        // ジャンプ中
+        if (!this.isGrounded || pos.y > this.data.deckY) {
+          this.vy -= this.data.gravity * dt;
+          pos.y += this.vy * dt;
+
+          if (this.vy <= 0 && pos.y <= this.data.deckY && onSafeDeck) {
+            pos.y = this.data.deckY;
+            this.vy = 0;
+            this.isGrounded = true;
+            return;
+          }
+
+          if (pos.y < this.data.deckY && !onSafeDeck) {
+            this.falling = true;
+            this.isGrounded = false;
+            this.setMovementEnabled(false);
+          }
+          return;
+        }
+
+        // 地上（deckY）で足場の上にいるとき
+        if (onSafeDeck) {
+          pos.y = this.data.deckY;
+          this.vy = 0;
+          this.isGrounded = true;
+        } else {
+          this.falling = true;
+          this.isGrounded = false;
+          this.vy = 0;
+          this.setMovementEnabled(false);
+        }
+      }
+    });
+
+    // 下が透けて見えるガラス＆フレームの空中橋を自動生成
+    AFRAME.registerComponent('glass-bridge-builder', {
+      init: function () {
+        const doc = document;
+        const root = this.el;
+        const addEl = (tag, attrs, parent = root) => {
+          const el = doc.createElement(tag);
+          Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+          parent.appendChild(el);
+          return el;
+        };
+
+        addEl('a-cylinder', { position: '-1.22 80.5 -21', rotation: '90 0 0', radius: '0.035', height: '37', color: '#e2e8f0' });
+        addEl('a-cylinder', { position: '1.22 80.5 -21', rotation: '90 0 0', radius: '0.035', height: '37', color: '#e2e8f0' });
+
+        for (let z = -6; z >= -36; z -= 3.0) {
+          addEl('a-box', {
+            position: `0 80 ${z}`,
+            width: '2.24',
+            height: '0.05',
+            depth: '1.8',
+            color: '#bae6fd',
+            material: 'transparent: true; opacity: 0.32; roughness: 0.1; metalness: 0.2'
+          });
+          addEl('a-box', { position: `0 80.02 ${z + 0.9}`, width: '2.3', height: '0.08', depth: '0.08', color: '#475569' });
+          addEl('a-box', { position: `0 80.02 ${z - 0.9}`, width: '2.3', height: '0.08', depth: '0.08', color: '#475569' });
+          addEl('a-box', { position: `-1.15 80.02 ${z}`, width: '0.08', height: '0.08', depth: '1.88', color: '#475569' });
+          addEl('a-box', { position: `1.15 80.02 ${z}`, width: '0.08', height: '0.08', depth: '1.88', color: '#475569' });
+          addEl('a-box', { position: `0 80.01 ${z}`, width: '0.04', height: '0.03', depth: '1.8', color: '#64748b' });
+        }
+      }
+    });
+
+    // 橋の周辺を流れて視界を遮る雲を自動生成
+    AFRAME.registerComponent('cloud-bank-builder', {
+      init: function () {
+        const doc = document;
+        const root = this.el;
+        const addEl = (tag, attrs, parent = root) => {
+          const el = doc.createElement(tag);
+          Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+          parent.appendChild(el);
+          return el;
+        };
+
+        const cloudPaths = [
+          { from: '-26 82.2 -12', to: '26 82.2 -12', dur: 11000 },
+          { from: '28 82.5 -21',  to: '-28 82.5 -21', dur: 13000 },
+          { from: '-26 82.2 -30', to: '26 82.2 -30', dur: 10000 }
+        ];
+
+        cloudPaths.forEach(path => {
+          const startPos = path.from.split(' ').slice(0, 3).join(' ');
+          const cloud = addEl('a-entity', {
+            class: 'drift-cloud',
+            position: startPos,
+            animation: `property: position; from: ${path.from}; to: ${path.to}; dur: ${path.dur}; dir: alternate; easing: easeInOutSine; loop: true`
+          });
+          // 複数の球体でモコモコの雲を構成
+          addEl('a-sphere', { position: '0 0 0', radius: '3.2', color: '#ffffff', material: 'transparent: true; opacity: 0.88' }, cloud);
+          addEl('a-sphere', { position: '-2.3 -0.3 0.5', radius: '2.4', color: '#f8fafc', material: 'transparent: true; opacity: 0.85' }, cloud);
+          addEl('a-sphere', { position: '2.4 -0.2 -0.4', radius: '2.6', color: '#f8fafc', material: 'transparent: true; opacity: 0.85' }, cloud);
+          addEl('a-sphere', { position: '0.4 1.1 0.3', radius: '2.2', color: '#ffffff', material: 'transparent: true; opacity: 0.85' }, cloud);
+        });
+      }
+    });
+
+    // 超高層ビル群と道路・車・歩行者（生活感）
+    AFRAME.registerComponent('metropolis-builder', {
+      init: function () {
+        const root = this.el;
+        const doc = document;
+        const addEl = (tag, attrs, parent = root) => {
+          const el = doc.createElement(tag);
+          Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+          parent.appendChild(el);
+          return el;
+        };
+
+        addEl('a-box', { position: '0 0.05 -22', width: '10', height: '0.1', depth: '260', color: '#1e293b' });
+        addEl('a-box', { position: '0 0.05 -22', width: '260', height: '0.1', depth: '10', color: '#1e293b' });
+        for (let z = -140; z <= 100; z += 12) {
+          addEl('a-box', { position: `0 0.12 ${z}`, width: '0.3', height: '0.02', depth: '5', color: '#fbbf24' });
+        }
+        for (let x = -120; x <= 120; x += 12) {
+          addEl('a-box', { position: `${x} 0.12 -22`, width: '5', height: '0.02', depth: '0.3', color: '#fbbf24' });
+        }
+
+        const buildingColors = ['#334155', '#3f4e64', '#475569', '#2b3a4a', '#526075'];
+        const windowColors = ['#fef08a', '#bae6fd', '#fde68a', '#a5f3fc'];
+        const coords = [
+          [-24, -10, 14, 48, 14], [-44, -10, 16, 62, 16], [-66, -10, 15, 38, 15],
+          [24, -10, 15, 54, 15],  [44, -10, 16, 42, 16],  [66, -10, 14, 58, 14],
+          [-24, -36, 16, 66, 16], [-45, -38, 18, 50, 18], [-68, -36, 15, 44, 15],
+          [24, -36, 15, 46, 15],  [45, -38, 17, 64, 17],  [68, -36, 16, 40, 16],
+          [-24, 8, 14, 34, 14],   [-44, 10, 15, 45, 15],  [24, 8, 14, 38, 14],
+          [44, 10, 16, 52, 16],   [-28, -62, 16, 56, 16], [28, -62, 16, 60, 16]
+        ];
+
+        coords.forEach(([x, z, w, h, d], idx) => {
+          addEl('a-box', {
+            position: `${x} ${h / 2} ${z}`,
+            width: `${w}`,
+            height: `${h}`,
+            depth: `${d}`,
+            color: buildingColors[idx % buildingColors.length]
+          });
+
+          const frontZ = z + d / 2 + 0.08;
+          for (let wy = 5; wy < h - 4; wy += 5) {
+            for (let wx = -w / 2 + 2.5; wx <= w / 2 - 2.5; wx += 3.5) {
+              if (((Math.abs(Math.round(x + z + wy + wx)) % 3) !== 0)) {
+                addEl('a-plane', {
+                  position: `${x + wx} ${wy} ${frontZ}`,
+                  width: '1.6',
+                  height: '2.2',
+                  color: windowColors[(idx + wy) % windowColors.length]
+                });
+              }
+            }
+          }
+        });
+
+        const carConfigs = [
+          { from: '-110 0.7 -19.5', to: '110 0.7 -19.5', dur: 14000, color: '#ef4444' },
+          { from: '110 0.7 -24.5',  to: '-110 0.7 -24.5', dur: 16000, color: '#3b82f6' },
+          { from: '-2.5 0.7 -130',  to: '-2.5 0.7 90',    dur: 15000, color: '#facc15' },
+          { from: '2.5 0.7 90',     to: '2.5 0.7 -130',   dur: 13000, color: '#10b981' }
+        ];
+        carConfigs.forEach(c => {
+          addEl('a-box', {
+            position: c.from.split(' ').slice(0, 3).join(' '),
+            width: '2.2',
+            height: '1.2',
+            depth: '4.2',
+            color: c.color,
+            animation: `property: position; from: ${c.from}; to: ${c.to}; dur: ${c.dur}; easing: linear; loop: true`
+          });
+        });
+
+        for (let i = 0; i < 16; i++) {
+          const side = i % 2 === 0 ? -6.5 : 6.5;
+          const startZ = -60 + i * 6;
+          const endZ = startZ + (i % 3 === 0 ? 28 : -28);
+          const walker = addEl('a-entity', {
+            position: `${side} 0 ${startZ}`,
+            animation: `property: position; from: ${side} 0 ${startZ}; to: ${side} 0 ${endZ}; dur: ${9000 + (i % 4) * 2000}; dir: alternate; easing: linear; loop: true`
+          });
+          addEl('a-cylinder', { position: '0 0.8 0', radius: '0.28', height: '1.1', color: i % 2 === 0 ? '#2563eb' : '#ea580c' }, walker);
+          addEl('a-sphere', { position: '0 1.55 0', radius: '0.22', color: '#fed7aa' }, walker);
+        }
+      }
+    });
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <strong>操作：</strong> WASD / 矢印キーで移動・<strong>Spaceでジャンプ</strong>・マウスドラッグで視点<br>
+    <strong>ギミック：</strong> 雲に入ると視界が遮られます！金のリング到達で<strong>CLEAR!</strong>、落下で<strong>GAME OVER</strong>
+  </div>
+
+  <div id="cloud-veil">☁ 雲の中… 視界が遮られています ☁</div>
+
+  <div id="game-over-overlay" class="overlay">
+    <h1>GAME OVER</h1>
+    <p>高さ80mの空中橋から落下しました…</p>
+    <button class="retry-btn">もう一度挑戦する（Rキー）</button>
+  </div>
+
+  <div id="clear-overlay" class="overlay">
+    <h1>CLEAR!</h1>
+    <p>雲と空中橋を乗り越えてゴールに到達しました！</p>
+    <button class="retry-btn">もう一度遊ぶ（Rキー）</button>
+  </div>
+
+  <a-scene background="color: #87CEEB" fog="type: exponential; color: #bae6fd; density: 0.0025">
+    <a-entity light="type: ambient; color: #e0f2fe; intensity: 0.9"></a-entity>
+    <a-entity light="type: directional; color: #fffbeb; intensity: 1.2" position="40 130 30"></a-entity>
+
+    <!-- 地上・超高層都市 -->
+    <a-plane position="0 0 -20" rotation="-90 0 0" width="500" height="500" color="#475569"></a-plane>
+    <a-entity metropolis-builder></a-entity>
+
+    <!-- スタートデッキ（y = 80） -->
+    <a-box position="0 80 0" width="8" height="1" depth="8.8" color="#475569"></a-box>
+    <a-cylinder position="-3.8 81.2 4.2" radius="0.12" height="2.4" color="#cbd5e1"></a-cylinder>
+    <a-cylinder position="3.8 81.2 4.2" radius="0.12" height="2.4" color="#cbd5e1"></a-cylinder>
+    <a-cylinder position="-3.8 81.2 -4.0" radius="0.12" height="2.4" color="#cbd5e1"></a-cylinder>
+    <a-cylinder position="3.8 81.2 -4.0" radius="0.12" height="2.4" color="#cbd5e1"></a-cylinder>
+
+    <!-- 下が透けて見えるガラス橋 -->
+    <a-entity glass-bridge-builder></a-entity>
+
+    <!-- 橋の周辺を流れて視界を遮る雲 -->
+    <a-entity cloud-bank-builder></a-entity>
+
+    <!-- ゴールタワー＆回る金のリング（y = 80, z = -43） -->
+    <a-box position="0 80 -43" width="9" height="1.2" depth="9" color="#334155"></a-box>
+    <a-torus id="goal-ring" position="0 83.5 -43" radius="1.6" tube="0.12" color="#ffd166"
+             animation="property: rotation; to: 0 360 0; dur: 5000; easing: linear; loop: true"></a-torus>
+
+    <!-- プレイヤーRig -->
+    <a-entity id="player" position="0 82 2" bridge-physics>
+      <a-camera look-controls wasd-controls="acceleration: 24"></a-camera>
+    </a-entity>
+  </a-scene>
+</body>
+</html>
